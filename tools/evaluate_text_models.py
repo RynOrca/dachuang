@@ -4,6 +4,7 @@ import csv
 import glob
 import json
 import os
+import types
 import sys
 import time
 import traceback
@@ -17,6 +18,24 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from inference_diffusion import DiffusionSampler, build_model as build_diffusion_model, restore_image
+
+
+def ensure_torchvision_functional_tensor_compat():
+    """兼容新版 torchvision 移除 transforms.functional_tensor 的情况。"""
+    try:
+        import torchvision.transforms.functional_tensor  # type: ignore # noqa: F401
+        return
+    except Exception:
+        pass
+
+    try:
+        from torchvision.transforms.functional import rgb_to_grayscale  # type: ignore
+    except Exception:
+        return
+
+    shim = types.ModuleType("torchvision.transforms.functional_tensor")
+    shim.rgb_to_grayscale = rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = shim
 
 
 def collect_paths(input_dir):
@@ -112,6 +131,7 @@ def ensure_dir(path):
 
 
 def build_realesrgan(args):
+    ensure_torchvision_functional_tensor_compat()
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from basicsr.utils.download_util import load_file_from_url
     from realesrgan import RealESRGANer
@@ -244,6 +264,7 @@ def is_sample_completed(output_dir, comparison_dir, base_name, methods):
         "bicubic": "bicubic",
         "realesrgan": "realesrgan",
         "diffusion": "diffusion",
+        "diffusion_realesrgan": "diffusion_realesrgan",
     }
     for method in methods:
         method_dir = method_to_dir.get(method)
@@ -263,7 +284,7 @@ def main():
         "--methods",
         type=str,
         default="bicubic,realesrgan,diffusion",
-        help="Comma-separated methods: bicubic,realesrgan,diffusion",
+        help="Comma-separated methods: bicubic,realesrgan,diffusion,diffusion_realesrgan",
     )
     parser.add_argument("--outscale", type=int, default=4, help="Output scale for baseline methods")
     parser.add_argument("--realesrgan_model", type=str, default="RealESRGAN_x4plus", help="Real-ESRGAN model name")
@@ -273,6 +294,7 @@ def main():
     parser.add_argument("--diffusion_profile_name", type=str, default="custom", help="Diffusion profile name from unified runner")
     parser.add_argument("--diffusion_cond_mode", type=str, default="concat", choices=["concat", "film"], help="Fallback cond_mode when checkpoint has no config")
     parser.add_argument("--diffusion_steps", type=int, default=1000, help="Diffusion sampling steps")
+    parser.add_argument("--diffusion_train_timesteps", type=int, default=1000, help="Training diffusion schedule steps (must match training)")
     parser.add_argument("--diffusion_min_side", type=int, default=256, help="Diffusion resize minimum side")
     parser.add_argument("--diffusion_outscale", type=float, default=4.0, help="Fixed output scale factor for diffusion inference")
     parser.add_argument("--diffusion_preserve_color", action="store_true", help="Preserve color in diffusion output")
@@ -295,6 +317,7 @@ def main():
         help="Fallback min side when CUDA OOM occurs during diffusion inference",
     )
     parser.add_argument("--gt_dir", type=str, default=None, help="Optional GT directory for quantitative metrics")
+    parser.add_argument("--strict_require_gt", action="store_true", help="Fail if --gt_dir is invalid or if no metric rows are produced")
     parser.add_argument("--metrics_csv", type=str, default="metrics.csv", help="Metrics csv filename under output_dir")
     parser.add_argument("--lpips", action="store_true", help="Enable LPIPS metric (requires lpips package)")
     parser.add_argument("--lpips_net", type=str, default="alex", choices=["alex", "vgg", "squeeze"], help="LPIPS backbone network")
@@ -313,11 +336,18 @@ def main():
     if not paths:
         raise FileNotFoundError(f"No evaluation inputs found under: {args.input_dir}")
 
+    if args.gt_dir and not os.path.isdir(args.gt_dir):
+        print(f"[warning] gt_dir does not exist or is not a directory: {args.gt_dir}")
+        print("[warning] Image metrics (PSNR/SSIM/LPIPS) will be skipped.")
+        if args.strict_require_gt:
+            raise FileNotFoundError(f"strict_require_gt is enabled but gt_dir is invalid: {args.gt_dir}")
+
     ensure_dir(args.output_dir)
     comparison_dir = ensure_dir(os.path.join(args.output_dir, "comparisons"))
 
+    requires_realesrgan = ("realesrgan" in methods) or ("diffusion_realesrgan" in methods)
     realesrgan = None
-    if "realesrgan" in methods:
+    if requires_realesrgan:
         realesrgan = build_realesrgan(args)
 
     diffusion_model = None
@@ -325,7 +355,8 @@ def main():
     diffusion_device = None
     diffusion_model_cpu = None
     diffusion_sampler_cpu = None
-    if "diffusion" in methods and os.path.exists(args.diffusion_model_path):
+    requires_diffusion = ("diffusion" in methods) or ("diffusion_realesrgan" in methods)
+    if requires_diffusion and os.path.exists(args.diffusion_model_path):
         diffusion_device = "cuda" if torch.cuda.is_available() else "cpu"
         diffusion_model = build_diffusion_model(
             args.diffusion_model_path,
@@ -333,7 +364,7 @@ def main():
             cond_mode=args.diffusion_cond_mode,
             use_decoder_attn=args.diffusion_decoder_attn,
         )
-        diffusion_sampler = DiffusionSampler(args.diffusion_steps, diffusion_device)
+        diffusion_sampler = DiffusionSampler(args.diffusion_train_timesteps, diffusion_device)
         diffusion_warmup_sec = None
         if not args.diffusion_no_warmup:
             try:
@@ -348,9 +379,10 @@ def main():
                 print(f"Diffusion warmup complete: {diffusion_warmup_sec:.4f}s")
             except Exception as err:
                 print(f"Diffusion warmup skipped due to error: {err}")
-    elif "diffusion" in methods:
+    elif requires_diffusion:
         print(f"Skip diffusion: model not found at {args.diffusion_model_path}")
         methods = [method for method in methods if method != "diffusion"]
+        methods = [method for method in methods if method != "diffusion_realesrgan"]
 
     print(f"Run evaluation on {len(paths)} images | methods={methods}")
     start_time = time.time()
@@ -421,31 +453,33 @@ def main():
                                 )
                             )
 
+            realesrgan_img = None
             if realesrgan is not None:
                 t0 = time.time()
                 realesrgan_img, _ = realesrgan.enhance(img, outscale=args.outscale)
-                save_method_output(args.output_dir, "realesrgan", base_name, realesrgan_img)
-                previews.append(add_label(resize_for_panel(realesrgan_img, display_shape), f"realesrgan_{args.realesrgan_model}"))
-                method_duration = time.time() - t0
-                method_elapsed["realesrgan"] += method_duration
-                method_success["realesrgan"] += 1
-                method_latency_samples["realesrgan"].append(method_duration)
-                if args.gt_dir:
-                    gt_path = find_gt_image(args.gt_dir, base_name)
-                    if gt_path:
-                        gt_img = cv2.imread(gt_path, cv2.IMREAD_COLOR)
-                        if gt_img is not None:
-                            realesrgan_metric = resize_for_panel(realesrgan_img, gt_img.shape)
-                            metric_rows.append(
-                                build_metric_row(
-                                    base_name=base_name,
-                                    method_name="realesrgan",
-                                    pred_img=realesrgan_metric,
-                                    gt_img=gt_img,
-                                    lpips_model=lpips_model,
-                                    lpips_device=lpips_device,
+                if "realesrgan" in methods:
+                    save_method_output(args.output_dir, "realesrgan", base_name, realesrgan_img)
+                    previews.append(add_label(resize_for_panel(realesrgan_img, display_shape), f"realesrgan_{args.realesrgan_model}"))
+                    method_duration = time.time() - t0
+                    method_elapsed["realesrgan"] += method_duration
+                    method_success["realesrgan"] += 1
+                    method_latency_samples["realesrgan"].append(method_duration)
+                    if args.gt_dir:
+                        gt_path = find_gt_image(args.gt_dir, base_name)
+                        if gt_path:
+                            gt_img = cv2.imread(gt_path, cv2.IMREAD_COLOR)
+                            if gt_img is not None:
+                                realesrgan_metric = resize_for_panel(realesrgan_img, gt_img.shape)
+                                metric_rows.append(
+                                    build_metric_row(
+                                        base_name=base_name,
+                                        method_name="realesrgan",
+                                        pred_img=realesrgan_metric,
+                                        gt_img=gt_img,
+                                        lpips_model=lpips_model,
+                                        lpips_device=lpips_device,
+                                    )
                                 )
-                            )
 
             if diffusion_model is not None and diffusion_sampler is not None:
                 t0 = time.time()
@@ -564,6 +598,60 @@ def main():
                                 )
                             )
 
+            if (
+                "diffusion_realesrgan" in methods
+                and diffusion_model is not None
+                and diffusion_sampler is not None
+                and realesrgan is not None
+            ):
+                if realesrgan_img is None:
+                    realesrgan_img, _ = realesrgan.enhance(img, outscale=args.outscale)
+
+                t0 = time.time()
+                diffusion_realesrgan_img = restore_image(
+                    model=diffusion_model,
+                    sampler=diffusion_sampler,
+                    img_bgr=realesrgan_img,
+                    device=diffusion_device,
+                    target_min_side=args.diffusion_min_side,
+                    timesteps=args.diffusion_steps,
+                    outscale=1.0,
+                    preserve_color=args.diffusion_preserve_color,
+                    enhance_strength=min(0.9, float(args.diffusion_enhance_strength)),
+                    strict_color_lock=args.diffusion_strict_color_lock,
+                    luma_strength=args.diffusion_luma_strength,
+                    max_luma_delta=args.diffusion_max_luma_delta,
+                    color_lock_strength=args.diffusion_color_lock_strength,
+                    edge_sharpen_strength=args.diffusion_edge_sharpen_strength,
+                    tile_size=args.diffusion_tile_size,
+                    tile_overlap=args.diffusion_tile_overlap,
+                    tile_blend=(not args.diffusion_no_tile_blend),
+                    match_luma_stats=(not args.diffusion_no_match_luma_stats),
+                )
+                method_duration = time.time() - t0
+                method_elapsed["diffusion_realesrgan"] += method_duration
+                method_success["diffusion_realesrgan"] += 1
+                method_latency_samples["diffusion_realesrgan"].append(method_duration)
+                save_method_output(args.output_dir, "diffusion_realesrgan", base_name, diffusion_realesrgan_img)
+                previews.append(add_label(resize_for_panel(diffusion_realesrgan_img, display_shape), "diffusion_realesrgan"))
+
+                if args.gt_dir:
+                    gt_path = find_gt_image(args.gt_dir, base_name)
+                    if gt_path:
+                        gt_img = cv2.imread(gt_path, cv2.IMREAD_COLOR)
+                        if gt_img is not None:
+                            hybrid_metric = resize_for_panel(diffusion_realesrgan_img, gt_img.shape)
+                            metric_rows.append(
+                                build_metric_row(
+                                    base_name=base_name,
+                                    method_name="diffusion_realesrgan",
+                                    pred_img=hybrid_metric,
+                                    gt_img=gt_img,
+                                    lpips_model=lpips_model,
+                                    lpips_device=lpips_device,
+                                )
+                            )
+
             comparison = np.hstack(previews)
             comparison_path = os.path.join(comparison_dir, f"{base_name}_compare.png")
             cv2.imwrite(comparison_path, comparison)
@@ -601,6 +689,11 @@ def main():
         print(f"Saved metrics csv: {metrics_path} | rows={len(metric_rows)}")
     else:
         metrics_path = os.path.join(args.output_dir, args.metrics_csv)
+        if args.gt_dir:
+            print("[warning] No metric rows were produced even though --gt_dir was provided.")
+            print("[warning] Please ensure GT images exist and share the same base filenames as inputs.")
+            if args.strict_require_gt:
+                raise RuntimeError("strict_require_gt is enabled but metric_rows=0")
 
     failure_csv_path = resolve_under_output(args.output_dir, args.failure_csv)
     if failure_rows:
@@ -624,6 +717,25 @@ def main():
             "p90_sec": round(float(np.percentile(latency_arr, 90)), 4) if latency_arr.size > 0 else None,
         }
 
+    top_slowest = sorted(sample_elapsed, key=lambda x: x["elapsed_sec"], reverse=True)[:10]
+    top_failures = [
+        {
+            "image": row.get("image"),
+            "error_type": row.get("error_type"),
+            "elapsed_sec": row.get("elapsed_sec"),
+            "error": row.get("error"),
+        }
+        for row in failure_rows[:10]
+    ]
+
+    top_slowest_path = os.path.join(args.output_dir, "top_slowest_samples.json")
+    with open(top_slowest_path, "w", encoding="utf-8") as f:
+        json.dump(top_slowest, f, indent=2, ensure_ascii=False)
+
+    top_failures_path = os.path.join(args.output_dir, "top_failure_samples.json")
+    with open(top_failures_path, "w", encoding="utf-8") as f:
+        json.dump(top_failures, f, indent=2, ensure_ascii=False)
+
     summary = {
         "input_dir": os.path.abspath(args.input_dir),
         "output_dir": os.path.abspath(args.output_dir),
@@ -640,16 +752,10 @@ def main():
         "avg_sec_per_success": round(elapsed_sec / success_count, 4) if success_count > 0 else None,
         "method_stats": method_stats,
         "error_type_counts": dict(error_type_counts),
-        "top_slowest_samples": sorted(sample_elapsed, key=lambda x: x["elapsed_sec"], reverse=True)[:10],
-        "top_failure_samples": [
-            {
-                "image": row.get("image"),
-                "error_type": row.get("error_type"),
-                "elapsed_sec": row.get("elapsed_sec"),
-                "error": row.get("error"),
-            }
-            for row in failure_rows[:10]
-        ],
+        "top_slowest_samples": top_slowest,
+        "top_failure_samples": top_failures,
+        "top_slowest_samples_json": os.path.abspath(top_slowest_path),
+        "top_failure_samples_json": os.path.abspath(top_failures_path),
         "failure_csv": os.path.abspath(failure_csv_path) if failure_rows else None,
         "metrics_csv": os.path.abspath(metrics_path) if metric_rows else None,
         "lpips_enabled": bool(args.lpips and lpips_model is not None),
@@ -660,6 +766,7 @@ def main():
     "diffusion_warmup_sec": round(diffusion_warmup_sec, 4) if 'diffusion_warmup_sec' in locals() and diffusion_warmup_sec is not None else None,
         "diffusion_config": {
             "steps": args.diffusion_steps,
+            "train_timesteps": args.diffusion_train_timesteps,
             "min_side": args.diffusion_min_side,
             "fallback_min_side": args.diffusion_fallback_min_side,
             "outscale": args.diffusion_outscale,

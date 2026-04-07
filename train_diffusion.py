@@ -113,6 +113,90 @@ class BinaryFocalLoss(nn.Module):
         return focal.mean()
 
 
+def compute_psnr_ssim(hr_tensor, pred_tensor, data_range=1.0):
+    """计算 PSNR 和 SSIM（简化版，无需额外依赖）。
+
+    Args:
+        hr_tensor: [B, C, H, W] ground truth in [-1, 1]
+        pred_tensor: [B, C, H, W] prediction in [-1, 1]
+        data_range: 数据范围 (默认 2.0 for [-1,1])
+    """
+    mse = F.mse_loss(pred_tensor, hr_tensor)
+    psnr = 10 * torch.log10(data_range ** 2 / (mse + 1e-8))
+
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    mu_x = pred_tensor.mean(dim=[2, 3], keepdim=True)
+    mu_y = hr_tensor.mean(dim=[2, 3], keepdim=True)
+    sigma_xx = ((pred_tensor - mu_x) ** 2).mean(dim=[2, 3], keepdim=True)
+    sigma_yy = ((hr_tensor - mu_y) ** 2).mean(dim=[2, 3], keepdim=True)
+    sigma_xy = ((pred_tensor - mu_x) * (hr_tensor - mu_y)).mean(dim=[2, 3], keepdim=True)
+
+    ssim_n = (2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)
+    ssim_d = (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_xx + sigma_yy + c2)
+    ssim = (ssim_n / ssim_d).mean()
+
+    return float(psnr.item()), float(ssim.item())
+
+
+def compute_composite_score(train_loss, val_psnr=None, val_ssim=None,
+                            w_loss=0.4, w_psnr=0.35, w_ssim=0.25):
+    """多指标综合评分用于 checkpoint 选优。
+
+    归一化各指标到 [0, 1] 后加权求和，分数越高越好。
+    - train_loss 越低越好 -> 1/(1+loss)
+    - val_psnr 越高越好 -> sigmoid((psnr-20)/5)
+    - val_ssim 越高越好 -> 直接使用
+
+    当验证指标不可用时（如首次 epoch），退化为纯 loss 选优。
+    """
+    s_loss = 1.0 / (1.0 + float(train_loss))
+    score = w_loss * s_loss
+    if val_psnr is not None:
+        import math
+        s_psnr = 1.0 / (1.0 + math.exp(-(float(val_psnr) - 25.0) / 5.0))
+        score += w_psnr * s_psnr
+    if val_ssim is not None:
+        score += w_ssim * float(val_ssim)
+    return score
+
+
+def run_validation(model, scheduler, val_loader, device, cond_mode="concat",
+                   max_batches=8):
+    """在验证集上运行推理并计算 PSNR/SSIM。
+
+    使用 t=0 的特殊推理模式：直接从 LR 条件重建（跳过扩散采样），
+    以快速获得质量评估。
+    返回 (avg_psnr, avg_ssim) 或 (None, None) 如果验证集为空。
+    """
+    model.eval()
+    total_psnr, total_ssim, count = 0.0, 0.0, 0
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if i >= max_batches:
+                break
+            hr_imgs = batch["HR"].to(device)
+            lr_imgs = batch["LR"].to(device)
+            lr_up = F.interpolate(lr_imgs, size=hr_imgs.shape[2:], mode="bilinear")
+
+            if cond_mode == "concat":
+                zeros = torch.zeros_like(hr_imgs)
+                model_input = torch.cat((zeros, lr_up), dim=1)
+                t = torch.zeros(hr_imgs.shape[0], device=device, dtype=torch.long)
+                pred, _ = model(model_input, t)
+            else:
+                t = torch.zeros(hr_imgs.shape[0], device=device, dtype=torch.long)
+                pred, _ = model(hr_imgs, t, cond=lr_imgs)
+
+            psnr, ssim_val = compute_psnr_ssim(hr_imgs, pred)
+            total_psnr += psnr
+            total_ssim += ssim_val
+            count += 1
+    model.train()
+    if count == 0:
+        return None, None
+    return total_psnr / count, total_ssim / count
+
+
 def build_dataloader(
     hr_dir,
     lr_dir,
@@ -125,12 +209,15 @@ def build_dataloader(
     distributed=False,
     rank=0,
     world_size=1,
+    degradation="none",
+    val_split=0.0,
 ):
     """构建训练集与 DataLoader。
 
     - 数据来源：TextSRDataset（从 HR 构造 LR/HR 对）
     - 在 CUDA 下启用 pin_memory，并可开启 cudnn.benchmark 提升吞吐
     - num_workers > 0 时使用 persistent_workers / prefetch_factor
+    - val_split > 0 时，将数据集末尾 val_split 比例作为验证集
     """
     dataset = TextSRDataset(
         hr_dir,
@@ -141,7 +228,18 @@ def build_dataloader(
         augment=True,
         blur_prob=0.5,
         noise_std=0.0,
+        degradation=degradation,
     )
+    val_dataset = None
+    if val_split > 0:
+        n_val = max(1, int(len(dataset) * val_split))
+        n_train = len(dataset) - n_val
+        from torch.utils.data import Subset
+        indices = list(range(len(dataset)))
+        train_dataset = Subset(dataset, indices[:n_train])
+        val_dataset = Subset(dataset, indices[n_train:])
+    else:
+        train_dataset = dataset
     # pin_memory=True 可加速 Host->GPU 传输
     pin_memory = device.startswith("cuda")
     if device.startswith("cuda"):
@@ -150,7 +248,7 @@ def build_dataloader(
 
     sampler = None
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
     loader_kwargs = {
         "batch_size": batch_size,
@@ -160,13 +258,20 @@ def build_dataloader(
         "pin_memory": pin_memory,
     }
     if num_workers > 0:
-        # 持久化 worker，避免每个 epoch 重建进程
         loader_kwargs["persistent_workers"] = True
-        # 每个 worker 预取 2 个 batch
         loader_kwargs["prefetch_factor"] = 2
 
-    dataloader = DataLoader(dataset, **loader_kwargs)
-    return dataset, dataloader, pin_memory, sampler
+    dataloader = DataLoader(train_dataset, **loader_kwargs)
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=min(batch_size, 4),
+            shuffle=False,
+            num_workers=max(0, num_workers // 2),
+            pin_memory=pin_memory,
+        )
+    return train_dataset, dataloader, pin_memory, sampler, val_loader
 
 
 def setup_distributed_training(enable_ddp: bool, backend: str = "nccl"):
@@ -223,6 +328,9 @@ def train(
     decoder_attn=False,
     ddp=False,
     dist_backend="nccl",
+    degradation="none",
+    val_split=0.08,
+    val_every=5,
 ):
     """扩散模型训练主函数。
 
@@ -305,11 +413,11 @@ def train(
             f"ddp={is_distributed} | world_size={world_size}"
         )
 
-    dataset, dataloader, pin_memory, train_sampler = build_dataloader(
+    dataset, dataloader, pin_memory, train_sampler, val_loader = build_dataloader(
         hr_dir=hr_dir,
         lr_dir=lr_dir,
         mask_dir=mask_dir,
-    scale=scale,
+        scale=scale,
         hr_size=hr_size,
         batch_size=batch_size,
         num_workers=num_workers,
@@ -317,6 +425,8 @@ def train(
         distributed=is_distributed,
         rank=rank,
         world_size=world_size,
+        degradation=degradation,
+        val_split=val_split,
     )
     if is_main_process:
         print(
@@ -358,6 +468,8 @@ def train(
     # 断点续训：加载模型参数 + 优化器状态（若可用）
     start_epoch = 0
     best_loss = float("inf")
+    best_composite_score = -float("inf")
+    val_psnr_best, val_ssim_best = None, None
     if resume and os.path.exists(latest_path):
         ckpt_raw = torch.load(latest_path, map_location=device_name)
         ckpt = parse_checkpoint(ckpt_raw)
@@ -388,8 +500,13 @@ def train(
             ckpt_best_loss = best_ckpt.get("avg_loss", None)
             if ckpt_best_loss is not None:
                 best_loss = float(ckpt_best_loss)
-                if is_main_process:
-                    print(f"Loaded historical best loss: {best_loss:.6f}")
+            ckpt_best_score = best_ckpt.get("composite_score", None)
+            if ckpt_best_score is not None:
+                best_composite_score = float(ckpt_best_score)
+                val_psnr_best = best_ckpt.get("val_psnr", None)
+                val_ssim_best = best_ckpt.get("val_ssim", None)
+            if is_main_process:
+                print(f"Loaded historical best: loss={best_loss:.6f} | composite={best_composite_score:.4f}")
         except Exception as err:
             if is_main_process:
                 print(f"Warning: failed to read best checkpoint metadata: {err}")
@@ -397,7 +514,10 @@ def train(
     if is_main_process and (not resume or not os.path.exists(train_log_csv)):
         with open(train_log_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "avg_loss", "best_loss", "lr", "world_size", "scale"])
+            writer.writerow([
+                "epoch", "avg_loss", "best_loss", "lr", "world_size", "scale",
+                "val_psnr", "val_ssim", "composite_score",
+            ])
 
     # 扩散噪声日程
     scheduler = DiffusionScheduler(num_timesteps=1000, device=device_name)
@@ -496,19 +616,50 @@ def train(
         if is_main_process:
             print(f"Epoch {epoch + 1} done | avg_loss={avg_epoch_loss:.6f}")
 
-            # 训练日志：每个 epoch 记录一行
+            val_psnr, val_ssim = None, None
+            if val_loader is not None and ((epoch + 1) % val_every == 0 or epoch == 0):
+                print("  Running validation...")
+                val_psnr, val_ssim = run_validation(
+                    model, scheduler, val_loader, device_name,
+                    cond_mode=cond_mode, max_batches=8,
+                )
+                if val_psnr is not None:
+                    print(f"  Validation: PSNR={val_psnr:.2f}dB | SSIM={val_ssim:.4f}")
+
+            composite_score = compute_composite_score(
+                avg_epoch_loss, val_psnr=val_psnr, val_ssim=val_ssim,
+            )
+
             cur_lr = optimizer.param_groups[0].get("lr", lr)
             with open(train_log_csv, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([epoch + 1, f"{avg_epoch_loss:.8f}", f"{best_loss:.8f}", f"{cur_lr:.10f}", world_size, scale])
+                writer.writerow([
+                    epoch + 1, f"{avg_epoch_loss:.8f}", f"{best_loss:.8f}",
+                    f"{cur_lr:.10f}", world_size, scale,
+                    f"{val_psnr:.4f}" if val_psnr is not None else "",
+                    f"{val_ssim:.6f}" if val_ssim is not None else "",
+                    f"{composite_score:.6f}",
+                ])
 
-            # 自动选优：保存训练损失最低的 checkpoint
-            if save_best and avg_epoch_loss < best_loss:
+            if save_best and composite_score > best_composite_score:
+                best_composite_score = composite_score
                 best_loss = avg_epoch_loss
+                if val_psnr is not None:
+                    val_psnr_best, val_ssim_best = val_psnr, val_ssim
                 save_checkpoint(best_path, epoch, avg_epoch_loss)
-                print(f"New best checkpoint at epoch {epoch + 1} | best_loss={best_loss:.6f}")
+                ckpt_for_meta = torch.load(best_path, map_location=device_name)
+                meta = parse_checkpoint(ckpt_for_meta)
+                meta["composite_score"] = float(composite_score)
+                meta["val_psnr"] = float(val_psnr) if val_psnr is not None else None
+                meta["val_ssim"] = float(val_ssim) if val_ssim is not None else None
+                torch.save(meta, best_path)
+                print(
+                    f"New best checkpoint at epoch {epoch + 1} | "
+                    f"score={composite_score:.4f} | loss={avg_epoch_loss:.6f}"
+                    + (f" | PSNR={val_psnr:.2f}" if val_psnr is not None else "")
+                    + (f" | SSIM={val_ssim:.4f}" if val_ssim is not None else "")
+                )
 
-            # 同步写 summary，便于工程化追踪
             summary = {
                 "experiment_name": experiment_name,
                 "latest_path": os.path.abspath(latest_path),
@@ -518,10 +669,15 @@ def train(
                 "epoch": epoch + 1,
                 "avg_loss": float(avg_epoch_loss),
                 "best_loss": float(best_loss),
+                "best_composite_score": float(best_composite_score),
+                "val_psnr_best": float(val_psnr_best) if val_psnr_best is not None else None,
+                "val_ssim_best": float(val_ssim_best) if val_ssim_best is not None else None,
                 "scale": scale,
                 "world_size": world_size,
                 "ddp": bool(is_distributed),
                 "cond_mode": cond_mode,
+                "degradation": degradation,
+                "val_split": val_split,
             }
             with open(summary_json, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -595,6 +751,25 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default=None, help="Force device, e.g. cuda or cpu")
     parser.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel (launch with torchrun)")
     parser.add_argument("--dist_backend", type=str, default="nccl", help="Distributed backend for DDP")
+    parser.add_argument(
+        "--degradation",
+        type=str,
+        default="text_realistic",
+        choices=["none", "light", "medium", "heavy", "text_realistic"],
+        help="Text degradation pipeline preset (WEEK_3)",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=float,
+        default=0.08,
+        help="Fraction of data for validation (e.g. 0.08 = 8%%); 0 disables validation",
+    )
+    parser.add_argument(
+        "--val_every",
+        type=int,
+        default=5,
+        help="Run validation every N epochs",
+    )
     args = parser.parse_args()
 
     # 将命令行参数传入训练函数
@@ -605,11 +780,11 @@ if __name__ == "__main__":
         hr_size=args.hr_size,
         train_size=args.train_size,
         lr=args.lr,
-    scale=args.scale,
+        scale=args.scale,
         resume=args.resume,
         device=args.device,
         lambda_seg=args.lambda_seg,
-    decoder_attn=args.decoder_attn,
+        decoder_attn=args.decoder_attn,
         num_workers=args.num_workers,
         hr_dir=args.hr_dir,
         lr_dir=args.lr_dir,
@@ -621,4 +796,7 @@ if __name__ == "__main__":
         save_best=args.save_best,
         ddp=args.ddp,
         dist_backend=args.dist_backend,
+        degradation=args.degradation,
+        val_split=args.val_split,
+        val_every=args.val_every,
     )

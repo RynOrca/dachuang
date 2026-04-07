@@ -1,0 +1,89 @@
+{
+  "input_dir": "/data/dachuang/TEST/eval_inputs",
+  "output_dir": "/data/dachuang/TEST/eval_outputs/cmp_fix_sanity_v2_soft",
+  "methods": [
+    "bicubic",
+    "realesrgan",
+    "diffusion"
+  ],
+  "total_images": 5,
+  "success": 5,
+  "failed": 0,
+  "skipped_existing": 0,
+  "metric_rows": 0,
+  "resume": false,
+  "fail_fast": false,
+  "elapsed_sec": 24.3949,
+  "throughput_img_per_sec": 0.205,
+  "avg_sec_per_success": 4.879,
+  "method_stats": {
+    "bicubic": {
+      "success": 5,
+      "total_sec": 0.8734,
+      "avg_sec": 0.1747,
+      "p50_sec": 0.0512,
+      "p90_sec": 0.443
+    },
+    "realesrgan": {
+      "success": 5,
+      "total_sec": 4.0,
+      "avg_sec": 0.8,
+      "p50_sec": 0.3602,
+      "p90_sec": 1.8731
+    },
+    "diffusion": {
+      "success": 5,
+      "total_sec": 13.5034,
+      "avg_sec": 2.7007,
+      "p50_sec": 1.6144,
+      "p90_sec": 4.7201
+    }
+  },
+  "error_type_counts": {},
+  "top_slowest_samples": [
+    {
+      "image": "eval_001",
+      "elapsed_sec": 8.9231
+    },
+    {
+      "image": "eval_002",
+      "elapsed_sec": 6.3076
+    },
+    {
+      "image": "eval_005",
+      "elapsed_sec": 3.6786
+    },
+    {
+      "image": "eval_003",
+      "elapsed_sec": 2.4217
+    },
+    {
+      "image": "eval_004",
+      "elapsed_sec": 2.3523
+    }
+  ],
+  "top_failure_samples": [],
+  "failure_csv": null,
+  "metrics_csv": null,
+  "lpips_enabled": true,
+  "lpips_net": "alex",
+  "diffusion_profile_name": "balanced",
+  "diffusion_model_profile": "text-priority",
+  "diffusion_warmup_enabled": true,
+  "diffusion_warmup_sec": 0.6101,
+  "diffusion_config": {
+    "steps": 140,
+    "min_side": 320,
+    "fallback_min_side": 256,
+    "outscale": 4.0,
+    "enhance_strength": 0.8,
+    "strict_color_lock": false,
+    "luma_strength": 1.0,
+    "max_luma_delta": 10.0,
+    "color_lock_strength": 1.0,
+    "edge_sharpen_strength": 0.08,
+    "tile_size": 0,
+    "tile_overlap": 32,
+    "tile_blend": true
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "input_dir": "/data/dachuang/TEST/eval_inputs",
+  "output_dir": "/data/dachuang/TEST/eval_outputs/cmp_hybrid_v1",
+  "methods": [
+    "bicubic",
+    "realesrgan",
+    "diffusion",
+    "diffusion_realesrgan"
+  ],
+  "total_images": 5,
+  "success": 5,
+  "failed": 0,
+  "skipped_existing": 0,
+  "metric_rows": 20,
+  "resume": false,
+  "fail_fast": false,
+  "elapsed_sec": 58.6686,
+  "throughput_img_per_sec": 0.0852,
+  "avg_sec_per_success": 11.7337,
+  "method_stats": {
+    "bicubic": {
+      "success": 5,
+      "total_sec": 0.8661,
+      "avg_sec": 0.1732,
+      "p50_sec": 0.0459,
+      "p90_sec": 0.4344
+    },
+    "realesrgan": {
+      "success": 5,
+      "total_sec": 3.9355,
+      "avg_sec": 0.7871,
+      "p50_sec": 0.3922,
+      "p90_sec": 1.8054
+    },
+    "diffusion": {
+      "success": 5,
+      "total_sec": 21.401,
+      "avg_sec": 4.2802,
+      "p50_sec": 2.881,
+      "p90_sec": 7.2962
+    },
+    "diffusion_realesrgan": {
+      "success": 5,
+      "total_sec": 21.7768,
+      "avg_sec": 4.3554,
+      "p50_sec": 3.1895,
+      "p90_sec": 7.291
+    }
+  },
+  "error_type_counts": {},
+  "top_slowest_samples": [
+    {
+      "image": "eval_002",
+      "elapsed_sec": 18.3893
+    },
+    {
+      "image": "eval_001",
+      "elapsed_sec": 15.884
+    },
+    {
+      "image": "eval_005",
+      "elapsed_sec": 11.3114
+    },
+    {
+      "image": "eval_003",
+      "elapsed_sec": 6.2793
+    },
+    {
+      "image": "eval_004",
+      "elapsed_sec": 6.0871
+    }
+  ],
+  "top_failure_samples": [],
+  "failure_csv": null,
+  "metrics_csv": "/data/dachuang/TEST/eval_outputs/cmp_hybrid_v1/metrics.csv",
+  "lpips_enabled": true,
+  "lpips_net": "alex",
+  "diffusion_profile_name": "text-balanced",
+  "diffusion_model_profile": "text-priority",
+  "diffusion_warmup_enabled": true,
+  "diffusion_warmup_sec": 0.52,
+  "diffusion_config": {
+    "steps": 180,
+    "train_timesteps": 1000,
+    "min_side": 352,
+    "fallback_min_side": 256,
+    "outscale": 4.0,
+    "enhance_strength": 0.75,
+    "strict_color_lock": true,
+    "luma_strength": 1.0,
+    "max_luma_delta": 14.0,
+    "color_lock_strength": 0.98,
+    "edge_sharpen_strength": 0.08,
+    "tile_size": 0,
+    "tile_overlap": 32,
+    "tile_blend": true
+  }
+}

@@ -5,6 +5,147 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
+class TextDegradationPipeline:
+    """文本图像专项退化管线。
+
+    模拟真实场景中文本图像的多种退化类型：
+    - 运动模糊（相机抖动/文字移动）
+    - JPEG 压缩伪影
+    - 局部遮挡（手指/阴影）
+    - 扫描噪声（纸张纹理、摩尔纹、椒盐噪声）
+    - 散焦模糊（失焦）
+
+    使用方式：pipeline = TextDegradationPipeline(prob_motion=0.3, prob_jpeg=0.5, ...)
+              degraded_img = pipeline.apply(img)
+    """
+
+    def __init__(
+        self,
+        prob_motion=0.0,
+        prob_jpeg=0.0,
+        prob_occlusion=0.0,
+        prob_scan_noise=0.0,
+        prob_defocus=0.0,
+        jpeg_quality_range=(30, 70),
+        occlusion_ratio=(0.02, 0.12),
+        motion_kernel_range=(3, 9),
+        defocus_sigma_range=(1.5, 4.0),
+        scan_noise_density=(0.001, 0.008),
+        seed=None,
+    ):
+        self.rng = np.random.RandomState(seed)
+        self.prob_motion = float(prob_motion)
+        self.prob_jpeg = float(prob_jpeg)
+        self.prob_occlusion = float(prob_occlusion)
+        self.prob_scan_noise = float(prob_scan_noise)
+        self.prob_defocus = float(prob_defocus)
+        self.jpeg_quality_range = tuple(jpeg_quality_range)
+        self.occlusion_ratio = tuple(occlusion_ratio)
+        self.motion_kernel_range = tuple(motion_kernel_range)
+        self.defocus_sigma_range = tuple(defocus_sigma_range)
+        self.scan_noise_density = tuple(scan_noise_density)
+
+    def _motion_blur(self, img):
+        ksize = self.rng.randint(self.motion_kernel_range[0], self.motion_kernel_range[1] + 1)
+        if ksize % 2 == 0:
+            ksize += 1
+        angle = self.rng.uniform(0, 180)
+        kernel = np.zeros((ksize, ksize), dtype=np.float32)
+        cx, cy = ksize // 2, ksize // 2
+        rad = np.deg2rad(angle)
+        for i in range(ksize):
+            offset = int(round((i - cy) * np.tan(rad)))
+            if 0 <= cx + offset < ksize:
+                kernel[cx + offset, i] = 1.0
+        kernel = kernel / kernel.sum()
+        return cv2.filter2D(img, -1, kernel)
+
+    def _jpeg_compression(self, img):
+        quality = self.rng.randint(self.jpeg_quality_range[0], self.jpeg_quality_range[1] + 1)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        _, encoded = cv2.imencode('.jpg', img, encode_param)
+        return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    def _partial_occlusion(self, img):
+        h, w = img.shape[:2]
+        area_min = h * w * self.occlusion_ratio[0]
+        area_max = h * w * self.occlusion_ratio[1]
+        n_rects = self.rng.randint(1, 4)
+        result = img.copy().astype(np.float32)
+        for _ in range(n_rects):
+            rw = self.rng.randint(int(w * 0.05), int(w * 0.35))
+            rh = self.rng.randint(int(h * 0.03), int(h * 0.20))
+            rx = self.rng.randint(0, max(w - rw, 1))
+            ry = self.rng.randint(0, max(h - rh, 1))
+            brightness = self.rng.uniform(30, 120)
+            result[ry:ry + rh, rx:rx + rw] = brightness
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _scan_noise(self, img):
+        result = img.astype(np.float32)
+        density = self.rng.uniform(*self.scan_noise_density)
+        sp_noise = self.rng.choice([0, 255], size=img.shape, p=[1 - density, density]).astype(np.float32)
+        mask = self.rng.random(img.shape) < density
+        result[mask] = sp_noise[mask]
+        moire_strength = self.rng.uniform(2, 8)
+        freq_x = self.rng.uniform(0.05, 0.15)
+        freq_y = self.rng.uniform(0.05, 0.15)
+        y_coords, x_coords = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+        moire = moire_strength * np.sin(2 * np.pi * (freq_x * x_coords + freq_y * y_coords)).astype(np.float32)
+        result = result +moire
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def _defocus_blur(self, img):
+        sigma = self.rng.uniform(*self.defocus_sigma_range)
+        ksize = int(sigma * 3) | 1
+        ksize = max(ksize, 3)
+        if ksize % 2 == 0:
+            ksize += 1
+        return cv2.GaussianBlur(img, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+
+    def apply(self, img):
+        if self.rng.random() < self.prob_motion:
+            img = self._motion_blur(img)
+        if self.rng.random() < self.prob_jpeg:
+            img = self._jpeg_compression(img)
+        if self.rng.random() < self.prob_occlusion:
+            img = self._partial_occlusion(img)
+        if self.rng.random() < self.prob_scan_noise:
+            img = self._scan_noise(img)
+        if self.rng.random() < self.prob_defocus:
+            img = self._defocus_blur(img)
+        return img
+
+    @staticmethod
+    def get_preset(name):
+        presets = {
+            "none": {},
+            "light": dict(
+                prob_motion=0.10, prob_jpeg=0.25, prob_occlusion=0.05,
+                prob_scan_noise=0.05, prob_defocus=0.10,
+                jpeg_quality_range=(50, 85), occlusion_ratio=(0.01, 0.06),
+            ),
+            "medium": dict(
+                prob_motion=0.25, prob_jpeg=0.45, prob_occlusion=0.12,
+                prob_scan_noise=0.15, prob_defocus=0.22,
+                jpeg_quality_range=(30, 75), occlusion_ratio=(0.02, 0.12),
+            ),
+            "heavy": dict(
+                prob_motion=0.40, prob_jpeg=0.65, prob_occlusion=0.22,
+                prob_scan_noise=0.30, prob_defocus=0.35,
+                jpeg_quality_range=(15, 55), occlusion_ratio=(0.04, 0.18),
+            ),
+            "text_realistic": dict(
+                prob_motion=0.20, prob_jpeg=0.50, prob_occlusion=0.08,
+                prob_scan_noise=0.20, prob_defocus=0.18,
+                jpeg_quality_range=(35, 70), occlusion_ratio=(0.02, 0.10),
+                motion_kernel_range=(3, 7), defocus_sigma_range=(1.5, 3.5),
+            ),
+        }
+        cfg = presets.get(name, presets["text_realistic"])
+        return TextDegradationPipeline(**cfg)
+
+
 class TextImageDataset(Dataset):
     def __init__(self, hr_dir, lr_dir):
         self.hr_dir = hr_dir
@@ -65,7 +206,9 @@ class TextSRDataset(Dataset):
             hr_size=256,
             augment=False,
             blur_prob=0.5,
-            noise_std=0.0):
+            noise_std=0.0,
+            degradation="none",
+            **deg_kwargs):
         """
         hr_dir: 存放 HR 图像的目录
         scale: 下采样倍率 (例如 4 表示 256 -> 64)
@@ -73,6 +216,9 @@ class TextSRDataset(Dataset):
         augment: 是否打开数据增强（对文本有用的二值化/扰动）
         blur_prob: 生成 LR 时加入高斯模糊的概率
         noise_std: 在 LR 上加入高斯噪声的标准差 (0.0 表示不加)
+        degradation: 文本退化管线预设名 ("none"/"light"/"medium"/"heavy"/"text_realistic")
+                     或 TextDegradationPipeline 实例
+        **deg_kwargs: 传给 TextDegradationPipeline 的额外参数
         """
         self.hr_dir = hr_dir
         self.file_names = [f for f in os.listdir(hr_dir) if
@@ -86,6 +232,13 @@ class TextSRDataset(Dataset):
         self.blur_prob = blur_prob
         self.noise_std = noise_std
 
+        if isinstance(degradation, TextDegradationPipeline):
+            self.degradation_pipeline = degradation
+        elif isinstance(degradation, str):
+            self.degradation_pipeline = TextDegradationPipeline.get_preset(degradation)
+        else:
+            self.degradation_pipeline = TextDegradationPipeline()
+
     def __len__(self):
         return len(self.file_names)
 
@@ -98,18 +251,20 @@ class TextSRDataset(Dataset):
         lr_size = self.hr_size // self.scale
         img_lr = cv2.resize(img_hr, (lr_size, lr_size), interpolation=cv2.INTER_CUBIC)
 
-        # 3) 随机高斯模糊
+        # 3) 随机高斯模糊（传统退化）
         if np.random.rand() < self.blur_prob:
-            # 随机核大小 (3 或 5)
             k = 3 if np.random.rand() < 0.7 else 5
             sigma = np.random.uniform(0.2, 1.5)
             img_lr = cv2.GaussianBlur(img_lr, (k, k), sigmaX=sigma)
 
-        # 4) 可选噪声
+        # 4) 可选噪声（传统退化）
         if self.noise_std > 0:
             noise = np.random.randn(*img_lr.shape) * (self.noise_std * 255.0)
             img_lr = img_lr.astype(np.float32) + noise
             img_lr = np.clip(img_lr, 0, 255).astype(np.uint8)
+
+        # 5) 文本专项退化管线（WEEK_3 新增：运动模糊/压缩/遮挡/扫描噪声/散焦）
+        img_lr = self.degradation_pipeline.apply(img_lr)
 
         return img_hr, img_lr
 
@@ -126,7 +281,8 @@ class TextSRDataset(Dataset):
         img_hr = cv2.cvtColor(img_hr, cv2.COLOR_BGR2RGB)
 
         # 可选增强（针对文本图像：二值化/形态学变换/亮度对比度扰动）
-        if self.augment:
+        # 注意：当使用配对 LR 数据时，不能只增强 HR，否则会破坏 LR-HR 对齐监督。
+        if self.augment and self.lr_dir is None:
             # 随机对比度/亮度
             alpha = np.random.uniform(0.8, 1.2)
             beta = np.random.uniform(-10, 10)
@@ -154,6 +310,8 @@ class TextSRDataset(Dataset):
                 # LR 缺失时回退到在线退化，保证训练不中断
                 img_hr, img_lr = self._make_lr(img_hr)
             else:
+                # 关键：cv2 读取为 BGR，这里统一转为 RGB，保持与 HR/在线退化路径一致。
+                img_lr = cv2.cvtColor(img_lr, cv2.COLOR_BGR2RGB)
                 # 使用预生成 LR，同时统一尺寸
                 img_hr = cv2.resize(img_hr, (self.hr_size, self.hr_size), interpolation=cv2.INTER_CUBIC)
                 lr_size = self.hr_size // self.scale

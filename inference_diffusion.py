@@ -42,7 +42,7 @@ class DiffusionSampler:
         self.alpha = 1.0 - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 
-    def sample_step(self, model, x, t, condition_img):
+    def sample_step(self, x, t, condition_img, model):
         cond_mode = getattr(model, "cond_mode", "concat")
         if cond_mode == "film":
             predicted_noise, _ = model(x, t, cond=condition_img)
@@ -62,6 +62,57 @@ class DiffusionSampler:
             sigma_t = torch.sqrt(beta_t)
             return mean + sigma_t * noise
         return mean
+
+    def sample_step_deterministic(self, x, t, condition_img, model, eta=0.0):
+        """DDIM deterministic sampling step (eta=0 -> fully deterministic).
+
+        相比 DDPM 的随机采样，DDIM:
+        - 同一输入始终产生相同输出（消除虎皮纹/随机失真）
+        - 可用更少步数达到相近质量
+        - eta 控制随机性: 0=纯确定性, 1=近似DDPM方差
+        """
+        cond_mode = getattr(model, "cond_mode", "concat")
+        if cond_mode == "film":
+            predicted_noise, _ = model(x, t, cond=condition_img)
+        else:
+            model_input = torch.cat((x, condition_img), dim=1)
+            predicted_noise, _ = model(model_input, t)
+
+        beta_t = self.beta[t][:, None, None, None]
+        alpha_t = self.alpha[t][:, None, None, None]
+        alpha_hat_t = self.alpha_hat[t][:, None, None, None]
+
+        if t[0] > 0:
+            alpha_hat_prev = self.alpha_hat[t[0] - 1].view(1, 1, 1, 1)
+        else:
+            alpha_hat_prev = torch.tensor(1.0, device=self.device).view(1, 1, 1, 1)
+
+        sigma_t = eta * torch.sqrt(
+            (1 - alpha_hat_prev) / (1 - alpha_hat_t) * (1 - alpha_t / alpha_hat_t)
+        )
+        pred_x0 = (x - torch.sqrt(1 - alpha_hat_t) * predicted_noise) / torch.sqrt(alpha_hat_t)
+        dir_xt = torch.sqrt(1 - alpha_hat_prev - sigma_t ** 2) * predicted_noise
+
+        mean = torch.sqrt(alpha_hat_prev) * pred_x0 + dir_xt
+        if t[0] > 0 and sigma_t.item() > 1e-8:
+            noise = torch.randn_like(x)
+            return mean + sigma_t * noise
+        return mean
+
+
+def map_sampling_index_to_train_t(step_idx, sample_steps, train_steps):
+    """将采样循环索引映射到训练噪声日程索引。
+
+    例如 sample_steps=180, train_steps=1000 时，会把 [179..0]
+    线性映射到 [999..0]，避免直接用 180 步重建一套新的 beta 日程。
+    """
+    if train_steps <= 1:
+        return 0
+    if sample_steps <= 1:
+        return int(train_steps - 1)
+    ratio = float(step_idx) / float(sample_steps - 1)
+    mapped = int(round(ratio * float(train_steps - 1)))
+    return max(0, min(train_steps - 1, mapped))
 
 
 def image_to_tensor(img_bgr, device):
@@ -100,11 +151,97 @@ def apply_edge_sharpen(image_bgr, strength=0.0):
 
 def sample_condition_image(model, sampler, condition, timesteps, device):
     current = torch.randn_like(condition)
+    sample_steps = max(1, int(timesteps))
+    train_steps = int(getattr(sampler, "num_timesteps", sample_steps))
     with torch.no_grad():
-        for i in tqdm(reversed(range(timesteps)), total=timesteps, leave=False):
-            t = torch.tensor([i], device=device)
-            current = sampler.sample_step(model, current, t, condition)
+        for i in tqdm(reversed(range(sample_steps)), total=sample_steps, leave=False):
+            mapped_t = map_sampling_index_to_train_t(i, sample_steps, train_steps)
+            t = torch.tensor([mapped_t], device=device)
+            current = sampler.sample_step(current, t, condition, model)
     return current
+
+
+def sample_condition_image_deterministic(
+    model, sampler, condition, timesteps, device,
+    noise_strength=0.0, eta=0.0, init_from_input=False,
+):
+    """DDIM + 可选条件初始化的确定性采样。
+
+    Args:
+        noise_strength: 初始噪声强度 (0=从条件图初始化, 1=纯随机)
+        eta: DDIM 随机性 (0=完全确定, 1=近似DDPM方差)
+        init_from_input: True 时从加噪条件图启动（而非纯噪声），大幅减少虎皮纹
+    """
+    sample_steps = max(1, int(timesteps))
+    train_steps = int(getattr(sampler, "num_timesteps", sample_steps))
+
+    if init_from_input and noise_strength < 1.0:
+        T_idx = train_steps - 1
+        sqrt_alpha_hat_T = float(sampler.alpha_hat[T_idx].sqrt())
+        sqrt_one_minus_alpha_hat_T = float((1 - sampler.alpha_hat[T_idx]).sqrt())
+        noise = torch.randn_like(condition) * noise_strength
+        current = sqrt_alpha_hat_T * condition + sqrt_one_minus_alpha_hat_T * noise
+    else:
+        current = torch.randn_like(condition)
+
+    with torch.no_grad():
+        for i in tqdm(reversed(range(sample_steps)), total=sample_steps, leave=False):
+            mapped_t = map_sampling_index_to_train_t(i, sample_steps, train_steps)
+            t = torch.tensor([mapped_t], device=device)
+            current = sampler.sample_step_deterministic(current, t, condition, model, eta=eta)
+    return current
+
+
+def apply_post_denoise(image_bgr, strength=0.5):
+    """后处理轻量去噪：保留边缘的同时平滑纹理噪声/斑纹。
+
+    使用双边滤波 (bilateral filter) 在不模糊边缘的前提下降噪。
+    strength: 0=不做任何处理, 1.0=最大去噪强度
+    """
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 1e-8:
+        return image_bgr
+    d = max(3, int(9 * strength))
+    d = d if d % 2 == 1 else d + 1
+    sigma_color = max(1.0, 75.0 * strength)
+    sigma_space = max(1.0, 75.0 * strength)
+    denoised = cv2.bilateralFilter(image_bgr, d, sigma_color, sigma_space)
+    return np.clip(denoised, 0, 255).astype(np.uint8)
+
+
+def compute_quality_score(img_bgr):
+    """计算简单的图像质量分数（用于智能降级决策）。
+
+    基于 Laplacian 方差（清晰度）+ 梯度幅度均值。
+    分数越高通常表示越清晰，但过高可能意味着噪声放大。
+    返回 (sharpness, gradient_mean) 元组。
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    sharpness = float(laplacian.var())
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_mean = float(np.mean(np.sqrt(grad_x ** 2 + grad_y ** 2)))
+    return sharpness, gradient_mean
+
+
+def smart_fallback(diffusion_output, fallback_bgr, input_bgr, threshold_ratio=0.3):
+    """智能降级：如果扩散输出质量明显差于回退图，则使用回退图。
+
+    通过比较扩散输出与输入图的梯度变化来判断是否出现严重退化。
+    threshold_ratio: 允许的退化阈值比例
+    """
+    diff_sharp, diff_grad = compute_quality_score(diffusion_output)
+    fb_sharp, fb_grad = compute_quality_score(fallback_bgr)
+    in_sharp, in_grad = compute_quality_score(input_bgr)
+
+    if diff_sharp <= 1.0:
+        return fallback_bgr, "zero_sharpness"
+    if fb_sharp > 0 and diff_sharp / max(fb_sharp, 1e-6) < threshold_ratio:
+        return fallback_bgr, f"sharpness_ratio_{diff_sharp/max(fb_sharp,1e-6):.2f}"
+    if in_grad > 0 and abs(diff_grad - in_grad) / in_grad > 2.0:
+        return fallback_bgr, f"gradient_spike_{diff_grad/in_grad:.2f}"
+    return diffusion_output, None
 
 
 def preserve_color_with_luminance(reference_bgr, enhanced_bgr):
@@ -215,6 +352,13 @@ def restore_image(
     tile_size=0,
     tile_overlap=32,
     tile_blend=True,
+    use_ddim=False,
+    ddim_eta=0.0,
+    noise_strength=0.0,
+    init_from_input=False,
+    post_denoise_strength=0.0,
+    smart_fallback_enabled=False,
+    fallback_bgr=None,
 ):
     sr_input = upscale_input(img_bgr, outscale=outscale)
     target_h, target_w = sr_input.shape[:2]
@@ -223,7 +367,14 @@ def restore_image(
         in_h, in_w = input_bgr.shape[:2]
         resized = smart_resize(input_bgr, target_min_side=target_min_side)
         condition = image_to_tensor(resized, device)
-        current = sample_condition_image(model, sampler, condition, timesteps, device)
+        if use_ddim:
+            current = sample_condition_image_deterministic(
+                model, sampler, condition, timesteps, device,
+                noise_strength=noise_strength, eta=ddim_eta,
+                init_from_input=init_from_input,
+            )
+        else:
+            current = sample_condition_image(model, sampler, condition, timesteps, device)
         restored_work = tensor_to_image(current)
         return cv2.resize(restored_work, (in_w, in_h), interpolation=cv2.INTER_CUBIC)
 
@@ -285,8 +436,15 @@ def restore_image(
     elif preserve_color:
         restored = preserve_color_with_luminance(reference_bgr=sr_input, enhanced_bgr=restored)
 
+    restored = apply_post_denoise(restored, strength=post_denoise_strength)
     restored = blend_images(base_bgr=sr_input, enhanced_bgr=restored, strength=enhance_strength)
     restored = apply_edge_sharpen(restored, strength=edge_sharpen_strength)
+
+    if smart_fallback_enabled and fallback_bgr is not None:
+        restored, fallback_reason = smart_fallback(restored, fallback_bgr, sr_input)
+        if fallback_reason is not None:
+            pass
+
     return restored
 
 
@@ -352,6 +510,7 @@ def main():
     parser.add_argument("--model_path", type=str, default="model/diffusion_textzoom_bs8_latest.pth", help="Path to diffusion checkpoint")
     parser.add_argument("--model_profile", type=str, default="text-priority", help="Model profile label for reporting")
     parser.add_argument("--timesteps", type=int, default=1000, help="Sampling steps")
+    parser.add_argument("--train_timesteps", type=int, default=1000, help="Training diffusion schedule steps (must match training setup)")
     parser.add_argument("--target_min_side", type=int, default=256, help="Resize minimum side before inference")
     parser.add_argument("--outscale", type=float, default=4.0, help="Fixed super-resolution scale factor")
     parser.add_argument("--preserve_color", action="store_true", help="Preserve original image chroma and only enhance luminance")
@@ -374,6 +533,13 @@ def main():
     parser.add_argument("--failure_csv", type=str, default="failures.csv", help="Failure csv filename under output")
     parser.add_argument("--summary_json", type=str, default="summary.json", help="Summary json filename under output")
     parser.add_argument("--no_warmup", action="store_true", help="Disable one-time warmup before processing")
+    parser.add_argument("--use_ddim", action="store_true", help="Use DDIM deterministic sampling (eliminates tiger-stripe artifacts, repeatable output)")
+    parser.add_argument("--ddim_eta", type=float, default=0.0, help="DDIM stochasticity: 0=fully deterministic (recommended), 1=DDPM-like variance")
+    parser.add_argument("--noise_strength", type=float, default=0.0, help="Initial noise strength for condition-init sampling: 0=start from input image, 1=pure random noise")
+    parser.add_argument("--init_from_input", action="store_true", help="Initialize diffusion from noisy input instead of pure random noise (reduces artifacts)")
+    parser.add_argument("--post_denoise_strength", type=float, default=0.0, help="Post-processing bilateral denoising strength: 0=off, 1.0=max denoise")
+    parser.add_argument("--smart_fallback", action="store_true", help="Enable smart fallback: if diffusion output is worse than fallback image, use fallback instead")
+    parser.add_argument("--fallback_image", type=str, default=None, help="Path to fallback image for smart_fallback mode (or 'auto' to use bicubic-upscaled input)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -402,7 +568,7 @@ def main():
         cond_mode=args.cond_mode,
         use_decoder_attn=args.decoder_attn,
     )
-    sampler = DiffusionSampler(args.timesteps, device)
+    sampler = DiffusionSampler(args.train_timesteps, device)
     warmup_sec = None
     if not args.no_warmup:
         try:
@@ -444,6 +610,13 @@ def main():
             if img is None:
                 raise ValueError(f"Unreadable image: {path}")
 
+            fallback_bgr = None
+            if args.smart_fallback:
+                if args.fallback_image == "auto" or (args.fallback_image is None and args.smart_fallback):
+                    fallback_bgr = upscale_input(img, outscale=args.outscale)
+                elif args.fallback_image and os.path.isfile(args.fallback_image):
+                    fallback_bgr = cv2.imread(args.fallback_image, cv2.IMREAD_COLOR)
+
             restored = restore_image(
                 model=model,
                 sampler=sampler,
@@ -460,6 +633,13 @@ def main():
                 color_lock_strength=args.color_lock_strength,
                 edge_sharpen_strength=args.edge_sharpen_strength,
                 match_luma_stats=(not args.no_match_luma_stats),
+                use_ddim=args.use_ddim,
+                ddim_eta=args.ddim_eta,
+                noise_strength=args.noise_strength,
+                init_from_input=args.init_from_input,
+                post_denoise_strength=args.post_denoise_strength,
+                smart_fallback_enabled=args.smart_fallback,
+                fallback_bgr=fallback_bgr,
             )
             cv2.imwrite(output_path, restored)
 

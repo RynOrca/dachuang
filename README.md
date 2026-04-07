@@ -25,129 +25,128 @@
 | 评估指标 | 同时关注图像质量和 OCR 准确率 | 主要关注视觉质量 |
 | 灵活性 | 多档预设，可平衡速度与质量 | 固定模型和参数 |
 
-## 🚀 快速开始
+## 🚀 先看结论：你到底该怎么用这个项目
 
-### 安装依赖
+如果你只关心「输入一张模糊图，输出一张清晰图」，只需要记住这一条命令：
 
-```bash
-# 创建并激活 Conda 环境（推荐）
-conda create -n text-enhance python=3.9
-conda activate text-enhance
-
-# 安装 PyTorch（根据你的 CUDA 版本）
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
-
-# 安装项目依赖
-pip install -r requirements.txt
-```
-
-### 基本使用（使用预训练模型）
-
-1. **单图像增强**：
 ```bash
 python run_all.py enhance \
-  -i eval_inputs \
-  -o eval_outputs/enhanced \
+  -i inputs/your_blur.png \
+  -o outputs/your_result \
   --preset text-balanced
 ```
 
-2. **批量对比评估**：
+输出图会在 `outputs/your_result` 下，这就是最终可交付给用户的清晰图，不是中间过程图。
+
+## ✅ 怎么判断“效果好不好”（用户视角）
+
+建议按这 3 层判断：
+
+1. **主观可读性（最重要）**
+   - 看文字边缘是否更完整、断笔是否减少、噪点是否不过度。
+   - 这是最终用户最关心的指标。
+
+2. **OCR 指标（业务可落地）**
+   - 看 `CER`、`WER`、`Accuracy`。
+   - 目标是：`CER/WER` 越低越好，`Accuracy` 越高越好。
+
+3. **图像指标（辅助）**
+   - 看 `PSNR/SSIM/LPIPS`。
+   - 目标是：`PSNR/SSIM` 越高越好，`LPIPS` 越低越好。
+
+> 实战建议：如果 OCR 指标明显更好，同时主观可读性也更好，就可以认定“比 Final2x 更适合文本增强”。
+
+---
+大创成员：输入这个激活环境
+
 ```bash
-python run_all.py compare \
-  --input_dir eval_inputs \
-  --output_dir eval_outputs/comparison \
-  --preset text-balanced
+chmod +x scripts/setup_realesrgan_env.sh
+source scripts/setup_realesrgan_env.sh
+```
+##### WEEK_1
+```bash
+# Step 1: 从桌面源照片生成 GT 高清裁剪图
+python tools/setup_eval_gt.py
+
+# Step 2: 编辑 eval_labels/labels.csv，填写每张图的 gt_text（真实文字内容）
+
+# Step 3: 一键跑通全流程（precheck → batch → OCR → report）
+python scripts/run_week1_eval.py
+```
+回滚方案：
+```bash
+# 删除 3 个新文件
+del tools\setup_eval_gt.py scripts\run_week1_eval.py eval_labels\labels.csv
+# run_all.py 的改动仅是新增函数和参数，不影响任何已有功能
 ```
 
-3. **生成评估报告**：
+
+##### WEEK_2
+
 ```bash
-python run_all.py report \
-  --output_dir eval_outputs/comparison \
-  --summary_json comparison_summary.json \
-  --report_html report.html
+# Step 1: 放置你的扩散模型 .pth 文件到 model/ 目录
+#    （这是当前唯一硬阻塞项）
+
+# Step 2: 用 prod-safe 预设测试单张图片
+python run_all.py enhance -i eval_inputs/eval_001.png -o outputs/test \
+  --preset prod-safe --model_path model/<你的模型>.pth --save_comparison
+```
+回滚方案：
+```bash
+git checkout -- inference_diffusion.py run_all.py
 ```
 
-## 📦 安装指南
+##### WEEK_3
+
+重新训练模型：
+```bash
+python train_diffusion.py --hr_dir dataset/HR --degradation text_realistic \
+  --val_split 0.08 --val_every 5 --batch_size 8 --epochs 1000 \
+  --experiment_name diffusion_week3_textreal \
+  --save_dir model
+
+# 多卡训练：
+
+export CUDA_VISIBLE_DEVICES=0,1,2,4,5,7
+
+torchrun --nproc_per_node=2 train_diffusion.py --hr_dir dataset/HR --degradation text_realistic \
+  --val_split 0.08 --val_every 5 --batch_size 8 --epochs 1000 \
+  --experiment_name diffusion_week3_textreal \
+  --save_dir model
+
+  ```
+
+
+---
+
+
+## 📦 安装
 
 ### 环境要求
 
 - Python 3.8+
 - PyTorch 1.7+（支持 CUDA）
-- GPU 内存 ≥ 8GB（训练），≥ 4GB（推理）
 
-### 完整安装步骤
+### 安装命令
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/your-username/dachuang-dachuang-text-enhancement.git
-cd dachuang-dachuang-text-enhancement
-
-# 2. 创建 Conda 环境
 conda create -n text-enhance python=3.9
 conda activate text-enhance
 
-# 3. 安装 PyTorch（示例为 CUDA 12.1）
 conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
 
-# 4. 安装项目依赖
 pip install -r requirements.txt
 
-# 5. 安装 PaddleOCR（用于 OCR 评估，可选）
+# 可选：OCR 评估
 pip install paddleocr
-# 注意：如需 GPU 支持，需额外安装 paddlepaddle-gpu
+
+# 可选：LPIPS 评估
+pip install lpips
 ```
 
-## 📊 数据准备
+## 🧭 一条主线：训练 → 选模型 → 测试 → 产出清晰图
 
-### TextZoom 数据集
-
-本项目使用 TextZoom 数据集进行训练。如果你有 TextZoom 数据集的 LMDB 文件，可以按以下步骤提取：
-
-```bash
-# 提取 train1 的 HR 图像
-python tools/extract_lmdb_images_generic.py \
-  --lmdb_dir TextZoom/train1 \
-  --out_dir dataset/HR \
-  --prefix train1 \
-  --only_hr
-
-# 提取 train2 的 HR 图像
-python tools/extract_lmdb_images_generic.py \
-  --lmdb_dir TextZoom/train2 \
-  --out_dir dataset/HR \
-  --prefix train2 \
-  --only_hr
-```
-
-### 生成训练三联数据（HR/LR/masks）
-
-```bash
-# 生成 x4 超分训练数据
-python tools/make_triplet_from_hr.py \
-  --hr_dir dataset/HR \
-  --out_root dataset_triplet/train \
-  --scale 4
-
-# 如果有关联的 mask 数据
-python tools/make_triplet_from_hr.py \
-  --hr_dir dataset/HR \
-  --mask_dir dataset/masks \
-  --out_root dataset_triplet/train \
-  --scale 4
-```
-
-输出目录结构：
-```
-dataset_triplet/
-  train/
-    HR/      # 高分辨率图像
-    LR/      # 低分辨率图像（Real-ESRGAN 风格退化）
-    masks/   # 文字区域掩码（可选）
-```
-
-## 🏋️ 训练指南
-
-### 单 GPU 训练
+### 1) 训练（单卡示例）
 
 ```bash
 python train_diffusion.py \
@@ -169,132 +168,97 @@ python train_diffusion.py \
   --save_every 5
 ```
 
-### 多 GPU 分布式训练（DDP）
+训练输出模型命名规则：
+
+- 最新权重：`model/<experiment_name>_latest.pth`
+- 最优权重：`model/<experiment_name>_best.pth`
+
+例如上面的命令会得到：
+
+- `model/diffusion_textzoom_bs8_latest.pth`
+- `model/diffusion_textzoom_bs8_best.pth`
+
+### 2) 用你训练好的模型直接清晰化图片（核心命令）
 
 ```bash
-# 2 卡训练示例
-torchrun --nproc_per_node=2 train_diffusion.py \
-  --ddp \
-  --dist_backend nccl \
-  --cond_mode concat \
-  --batch_size 16 \
-  --epochs 200 \
-  --scale 4 \
-  --hr_size 256 \
-  --train_size 256 \
-  --lr 8e-5 \
-  --lambda_seg 0.2 \
-  --num_workers 8 \
-  --hr_dir dataset_triplet/train/HR \
-  --lr_dir dataset_triplet/train/LR \
-  --mask_dir dataset_triplet/train/masks \
-  --save_dir model \
-  --experiment_name diffusion_ddp_2gpu \
-  --save_best \
-  --save_every 5 \
-  --archive_every 20
-```
-
-### 训练参数说明
-
-| 参数 | 说明 |
-|------|------|
-| `--scale` | 超分倍率（4 表示 4 倍超分，1 表示同分辨率清晰化） |
-| `--hr_size` | 训练时 HR 图像的裁剪尺寸 |
-| `--batch_size` | 批大小（根据 GPU 内存调整） |
-| `--lr` | 学习率 |
-| `--lambda_seg` | 分割辅助损失的权重（0 表示禁用） |
-| `--save_dir` | 模型保存目录 |
-| `--experiment_name` | 实验名称，用于组织保存的模型文件 |
-
-## 🔍 推理指南
-
-### 使用训练好的模型进行推理
-
-```bash
-# 4 倍超分推理
-python inference_diffusion.py \
-  -i eval_inputs \
-  -o eval_outputs/diffusion_results \
-  --model_path model/diffusion_train_best.pth \
-  --outscale 4 \
-  --timesteps 180 \
-  --target_min_side 352
-```
-
-### 使用统一入口脚本
-
-```bash
-# 使用预设（推荐）
 python run_all.py enhance \
-  -i eval_inputs \
-  -o eval_outputs/enhanced \
+  -i inputs \
+  -o outputs/enhanced \
+  --model_path model/diffusion_textzoom_bs8_best.pth \
   --preset text-balanced
-
-# 自定义参数
-python run_all.py enhance \
-  -i eval_inputs \
-  -o eval_outputs/enhanced \
-  --steps 180 \
-  --min_side 352 \
-  --max_luma_delta 14.0 \
-  --edge_sharpen_strength 0.35
 ```
 
-### 预设说明
+> 这一步产出的就是你最终要给用户看的结果图。
 
-| 预设 | 适用场景 | 特点 |
-|------|----------|------|
-| `fast` | 速度优先 | 低时延，适合实时应用 |
-| `balanced` | 平衡模式 | 速度与质量的平衡（推荐） |
-| `best` | 质量优先 | 最高质量，速度较慢 |
-| `text-fast` | 文本快速增强 | 轻锐化 + 强保色，适合批量处理 |
-| `text-balanced` | 文本平衡模式 | 默认文本增强参数（推荐） |
-| `text-best` | 文本最佳质量 | 强锐化，极致文本细节 |
-
-## 📈 评估指南
-
-### 图像质量评估（PSNR/SSIM）
+### 3) 和 Final2x（Real-ESRGAN）做同场对比
 
 ```bash
-python tools/evaluate_text_models.py \
+python run_all.py batch \
   --input_dir eval_inputs \
-  --output_dir eval_outputs/comparison \
-  --methods bicubic,diffusion \
-  --outscale 4 \
-  --diffusion_model_path model/diffusion_train_best.pth \
-  --diffusion_outscale 4 \
-  --diffusion_steps 180 \
-  --diffusion_min_side 352
+  --output_dir eval_outputs/cmp_final2x \
+  --methods bicubic,realesrgan,diffusion \
+  --model_path model/diffusion_textzoom_bs8_best.pth \
+  --preset text-balanced \
+  --gt_dir eval_gt \
+  --lpips
 ```
 
-### OCR 准确率评估
+输出目录说明：
+
+- `eval_outputs/cmp_final2x/realesrgan/`：Final2x 基线输出
+- `eval_outputs/cmp_final2x/diffusion/`：本项目输出
+- `eval_outputs/cmp_final2x/comparisons/`：拼图对比图
+- `eval_outputs/cmp_final2x/metrics.csv`：PSNR/SSIM/LPIPS
+- `eval_outputs/cmp_final2x/summary.json`：整体汇总
+
+### 4) OCR 评测（判断“可读性是否真的更好”）
 
 ```bash
-python tools/evaluate_ocr_metrics.py \
-  --pred_dir eval_outputs/diffusion_results \
-  --gt_csv eval_inputs/labels.csv \
+python run_all.py ocr-eval \
+  --pred_dir eval_outputs/cmp_final2x/diffusion \
+  --gt_csv eval_labels/labels.csv \
   --image_col image \
   --text_col text \
-  --suffix _diffusion \
   --ocr_backend paddleocr \
   --lang ch \
   --device gpu \
-  --output_csv ocr_metrics_detail.csv \
-  --output_json ocr_metrics_summary.json
+  --output_csv ocr_metrics_diffusion.csv \
+  --output_json ocr_metrics_diffusion.json
 ```
 
-### 完整评估流程（一键式）
+再将 `--pred_dir` 改成 `eval_outputs/cmp_final2x/realesrgan` 再跑一次，就能直接比较你和 Final2x 的 OCR 指标。
+
+### 5) 一键完整评估（图像指标 + OCR + 报告）
 
 ```bash
 python run_all.py full-eval \
   --input_dir eval_inputs \
   --output_dir eval_outputs/full_evaluation \
   --gt_dir eval_gt \
-  --gt_csv eval_inputs/labels.csv \
+  --gt_csv eval_labels/labels.csv \
   --methods bicubic,diffusion \
+  --model_path model/diffusion_textzoom_bs8_best.pth \
   --lpips \
   --report_html full_eval_report.html
+```
+
+说明：
+
+- `full-eval` 会默认把 OCR 输入目录设为 `<output_dir>/diffusion`。
+- 若你想评估其他目录，可显式加 `--pred_dir`。
+
+## 📁 数据文件约定（避免“找不到 gt_csv/gt_dir”）
+
+- `eval_inputs/`：待增强输入图
+- `eval_gt/`：与输入同名的 GT 清晰图（用于 PSNR/SSIM/LPIPS）
+- `eval_labels/labels.csv`：OCR 标签 CSV（至少包含 `image` 和 `text` 两列）
+
+示例 CSV：
+
+```csv
+image,text
+eval_001.png,欢迎使用文本增强
+eval_002.png,发票号码123456
 ```
 
 ## 🏗️ 高级功能
@@ -361,76 +325,6 @@ python run_all.py gui
 
 启动桌面 GUI，提供可视化操作界面。
 
-## 🖥️ 服务器训练指南
-
-### 环境检查
-
-```bash
-# 检查 GPU 状态
-nvidia-smi
-
-# 检查 PyTorch CUDA 支持
-python -c "import torch; print('CUDA available:', torch.cuda.is_available(), 'Device count:', torch.cuda.device_count())"
-
-# 检查 PaddlePaddle GPU 支持
-python -c "import paddle; print('Paddle compiled with CUDA:', paddle.is_compiled_with_cuda())"
-```
-
-### 多卡训练示例（4 张 GPU）
-
-```bash
-# 设置使用的 GPU
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-# 启动 DDP 训练
-torchrun --nproc_per_node=4 train_diffusion.py \
-  --ddp \
-  --dist_backend nccl \
-  --cond_mode concat \
-  --batch_size 32 \
-  --epochs 200 \
-  --scale 4 \
-  --hr_size 256 \
-  --train_size 256 \
-  --lr 1e-4 \
-  --lambda_seg 0.2 \
-  --num_workers 16 \
-  --hr_dir dataset_triplet/train/HR \
-  --lr_dir dataset_triplet/train/LR \
-  --mask_dir dataset_triplet/train/masks \
-  --save_dir model \
-  --experiment_name diffusion_ddp_4gpu \
-  --save_best \
-  --save_every 10 \
-  --archive_every 50
-```
-
-### 服务器推理与评估
-
-```bash
-# 使用特定 GPU 推理
-CUDA_VISIBLE_DEVICES=0 python inference_diffusion.py \
-  -i eval_inputs \
-  -o eval_outputs/server_results \
-  --model_path model/diffusion_ddp_4gpu_best.pth \
-  --outscale 4 \
-  --timesteps 200 \
-  --target_min_side 384
-
-# 服务器端完整评估
-CUDA_VISIBLE_DEVICES=0 python tools/evaluate_text_models.py \
-  --input_dir eval_inputs \
-  --output_dir eval_outputs/server_eval \
-  --methods bicubic,diffusion \
-  --outscale 4 \
-  --diffusion_model_path model/diffusion_ddp_4gpu_best.pth \
-  --diffusion_outscale 4 \
-  --diffusion_steps 200 \
-  --diffusion_min_side 384 \
-  --gt_dir eval_gt \
-  --metrics_csv server_metrics.csv
-```
-
 ## ❓ 常见问题
 
 ### Q1: CUDA 内存不足（OOM）
@@ -452,9 +346,10 @@ CUDA_VISIBLE_DEVICES=0 python tools/evaluate_text_models.py \
 ### Q3: 如何选择最佳模型
 
 **优先级**：
-1. 查看评估指标（如有 GT）：选择 PSNR/SSIM 最高的 checkpoint
-2. 人工视觉检查：重点关注文字边缘、断笔、可读性
-3. 保留 `*_best.pth` 和对应的训练命令以便复现
+1. 先看 OCR：`CER/WER` 更低、`Accuracy` 更高者优先
+2. 再看主观可读性：文字边缘、断笔、伪影
+3. 最后参考 PSNR/SSIM/LPIPS
+4. 优先使用 `*_best.pth` 作为线上候选模型
 
 ### Q4: OCR 评估失败
 
@@ -462,7 +357,8 @@ CUDA_VISIBLE_DEVICES=0 python tools/evaluate_text_models.py \
 1. 确认安装了 PaddleOCR：`pip show paddleocr`
 2. 确认 PaddlePaddle GPU 版本与 CUDA 匹配
 3. 检查 PP-OCRv5 模型文件是否存在
-4. 确认 CSV 文件格式正确，包含 `image` 和 `text` 列
+4. 确认 `--gt_csv` 路径存在，且包含 `image` 和 `text` 列
+5. 确认 `--pred_dir` 与当前评测输出目录一致（例如 `eval_outputs/full_evaluation/diffusion`）
 
 ## 📝 许可证
 

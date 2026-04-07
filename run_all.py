@@ -1,4 +1,6 @@
 import argparse
+import csv
+import glob
 import json
 import os
 import subprocess
@@ -63,6 +65,38 @@ PRESETS: Dict[str, Dict[str, object]] = {
 		"max_luma_delta": 12.0,
 		"color_lock_strength": 1.00,
 		"edge_sharpen_strength": 0.45,
+	},
+	"prod-safe": {
+		"steps": 100,
+		"min_side": 256,
+		"outscale": 4.0,
+		"enhance_strength": 0.85,
+		"use_ddim": True,
+		"ddim_eta": 0.0,
+		"init_from_input": True,
+		"noise_strength": 0.15,
+		"post_denoise_strength": 0.35,
+		"smart_fallback": True,
+		"luma_strength": 0.80,
+		"max_luma_delta": 18.0,
+		"color_lock_strength": 0.95,
+		"edge_sharpen_strength": 0.20,
+	},
+	"prod-quality": {
+		"steps": 180,
+		"min_side": 320,
+		"outscale": 4.0,
+		"enhance_strength": 0.92,
+		"use_ddim": True,
+		"ddim_eta": 0.0,
+		"init_from_input": True,
+		"noise_strength": 0.10,
+		"post_denoise_strength": 0.25,
+		"smart_fallback": True,
+		"luma_strength": 0.90,
+		"max_luma_delta": 14.0,
+		"color_lock_strength": 0.98,
+		"edge_sharpen_strength": 0.30,
 	},
 }
 
@@ -186,6 +220,109 @@ def run_python_script(script_path: Path, args: List[str], dry_run: bool = False)
 	return int(completed.returncode)
 
 
+def ensure_exists(path_value: Optional[str], label: str, must_be_dir: bool = False, errors: Optional[List[str]] = None) -> None:
+	if not path_value:
+		(errors if errors is not None else []).append(f"{label} is empty")
+		return
+	path = path_value if os.path.isabs(path_value) else str(ROOT_DIR / path_value)
+	if must_be_dir:
+		if not os.path.isdir(path):
+			(errors if errors is not None else []).append(f"{label} directory not found: {path_value}")
+	else:
+		if not os.path.exists(path):
+			(errors if errors is not None else []).append(f"{label} path not found: {path_value}")
+
+
+def _validate_labels_csv(csv_path: str, errors: List[str]) -> None:
+	if not os.path.isfile(csv_path):
+		errors.append(f"labels_csv not found: {csv_path}")
+		return
+	try:
+		with open(csv_path, "r", encoding="utf-8") as f:
+			reader = csv.DictReader(f)
+			if reader.fieldnames is None:
+				errors.append(f"labels_csv is empty or has no header: {csv_path}")
+				return
+			required = {"image_name", "gt_text"}
+			missing = required - set(reader.fieldnames)
+			if missing:
+				errors.append(f"labels_csv missing required columns {missing}: {csv_path} (has: {reader.fieldnames})")
+			rows = list(reader)
+			if len(rows) == 0:
+				errors.append(f"labels_csv has no data rows: {csv_path}")
+			else:
+				empty_gt = [r.get("image_name", "?") for r in rows if not (r.get("gt_text") or "").strip()]
+				if empty_gt:
+					errors.append(f"labels_csv has {len(empty_gt)} rows with empty gt_text (first: {empty_gt[:3]}): {csv_path}")
+	except Exception as exc:
+		errors.append(f"labels_csv read error: {csv_path} | {exc}")
+
+
+def _validate_eval_set_completeness(
+	input_dir: Optional[str],
+	gt_dir: Optional[str],
+	labels_csv_path: Optional[str],
+	errors: List[str],
+) -> None:
+	input_dir = input_dir if input_dir else "eval_inputs"
+	gt_dir = gt_dir if gt_dir else "eval_gt"
+	labels_csv_path = labels_csv_path if labels_csv_path else os.path.join("eval_labels", "labels.csv")
+	input_files = set()
+	if os.path.isdir(input_dir):
+		for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+			input_files.update(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(input_dir, ext)))
+	gt_files = set()
+	if os.path.isdir(gt_dir):
+		for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+			gt_files.update(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(gt_dir, ext)))
+	if input_files and gt_files:
+		missing_gt = sorted(input_files - gt_files)
+		if missing_gt:
+			errors.append(f"eval_gt/ missing images for {len(missing_gt)} inputs (first 5: {missing_gt[:5]})")
+		extra_gt = sorted(gt_files - input_files)
+		if extra_gt:
+			errors.append(f"eval_gt/ has {len(extra_gt)} images not in eval_inputs (first 5: {extra_gt[:5]})")
+
+
+def run_precheck(
+	input_dir: Optional[str],
+	model_path: Optional[str],
+	gt_dir: Optional[str] = None,
+	gt_csv: Optional[str] = None,
+	require_gt: bool = False,
+	require_ocr_csv: bool = False,
+	quiet: bool = False,
+	labels_csv: Optional[str] = None,
+ strict_eval_set: bool = False,
+) -> int:
+	import glob as _glob
+	errors: List[str] = []
+	ensure_exists(input_dir, "input_dir", must_be_dir=True, errors=errors)
+	ensure_exists(model_path, "model_path", must_be_dir=False, errors=errors)
+
+	if gt_dir is not None or require_gt:
+		ensure_exists(gt_dir, "gt_dir", must_be_dir=True, errors=errors)
+	if gt_csv is not None or require_ocr_csv:
+		ensure_exists(gt_csv, "gt_csv", must_be_dir=False, errors=errors)
+		_validate_labels_csv(gt_csv or "", errors)
+
+	if labels_csv:
+		_validate_labels_csv(labels_csv, errors)
+
+	if strict_eval_set:
+		_validate_eval_set_completeness(input_dir, gt_dir, labels_csv or gt_csv or None, errors)
+
+	if not quiet:
+		if errors:
+			print("[precheck] FAILED")
+			for item in errors:
+				print(f"  - {item}")
+		else:
+			print("[precheck] PASS")
+
+	return 1 if errors else 0
+
+
 def build_batch_script_args(args: argparse.Namespace) -> List[str]:
 	script_args = [
 		"--input_dir", args.input_dir,
@@ -196,6 +333,7 @@ def build_batch_script_args(args: argparse.Namespace) -> List[str]:
 		"--outscale", str(int(round(args.outscale))),
 		"--diffusion_model_path", args.model_path,
 		"--diffusion_steps", str(args.steps),
+		"--diffusion_train_timesteps", str(args.train_timesteps),
 		"--diffusion_min_side", str(args.min_side),
 		"--diffusion_fallback_min_side", str(args.fallback_min_side),
 		"--diffusion_outscale", str(args.outscale),
@@ -222,6 +360,8 @@ def build_batch_script_args(args: argparse.Namespace) -> List[str]:
 	if args.lpips:
 		script_args.append("--lpips")
 		script_args.extend(["--lpips_net", args.lpips_net])
+	if getattr(args, "strict_require_gt", False):
+		script_args.append("--strict_require_gt")
 	if args.resume:
 		script_args.append("--resume")
 	if args.fail_fast:
@@ -278,11 +418,20 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
 	if not preset:
 		return args
 
+	_BOOLEAN_FLAGS = {
+		"use_ddim", "init_from_input", "smart_fallback",
+		"preserve_color", "strict_color_lock", "decoder_attn",
+		"no_warmup", "no_tile_blend", "save_comparison",
+		"resume", "fail_fast",
+	}
+
 	for key, value in preset.items():
 		if hasattr(args, key):
 			current = getattr(args, key)
 			if current is None:
 				setattr(args, key, value)
+			elif key in _BOOLEAN_FLAGS and value is True:
+				setattr(args, key, True)
 	return args
 
 
@@ -302,6 +451,7 @@ def add_shared_diffusion_args(parser: argparse.ArgumentParser) -> None:
 	parser.add_argument("--model_path", type=str, default=None, help="Diffusion checkpoint path (override model profile default)")
 	parser.add_argument("--outscale", type=float, default=None, help="Output scale factor")
 	parser.add_argument("--steps", type=int, default=None, help="Diffusion sampling steps")
+	parser.add_argument("--train_timesteps", type=int, default=None, help="Diffusion training schedule steps (usually 1000)")
 	parser.add_argument("--min_side", type=int, default=None, help="Minimum side length before diffusion")
 	parser.add_argument("--fallback_min_side", type=int, default=None, help="Fallback min side on CUDA OOM")
 	parser.add_argument("--enhance_strength", type=float, default=None, help="Blend strength in [0,1]")
@@ -316,6 +466,13 @@ def add_shared_diffusion_args(parser: argparse.ArgumentParser) -> None:
 	parser.add_argument("--strict_color_lock", action="store_true", help="Use strict color lock")
 	parser.add_argument("--decoder_attn", action="store_true", help="Enable decoder attention")
 	parser.add_argument("--no_warmup", action="store_true", help="Disable diffusion warmup")
+	parser.add_argument("--use_ddim", action="store_true", help="Use DDIM deterministic sampling (eliminates tiger-stripe artifacts)")
+	parser.add_argument("--ddim_eta", type=float, default=None, help="DDIM stochasticity: 0=deterministic (recommended), 1=DDPM-like")
+	parser.add_argument("--noise_strength", type=float, default=None, help="Initial noise strength: 0=from input, 1=pure random")
+	parser.add_argument("--init_from_input", action="store_true", help="Initialize from noisy input (reduces artifacts)")
+	parser.add_argument("--post_denoise_strength", type=float, default=None, help="Post bilateral denoising: 0=off, 1.0=max")
+	parser.add_argument("--smart_fallback", action="store_true", help="Enable smart fallback when diffusion degrades quality")
+	parser.add_argument("--fallback_image", type=str, default=None, help="Fallback image path or 'auto' for bicubic")
 
 
 def add_guardrail_args(parser: argparse.ArgumentParser, default_failure_csv: str, default_summary_json: str) -> None:
@@ -331,6 +488,7 @@ def normalize_diffusion_args(args: argparse.Namespace) -> argparse.Namespace:
 		args.model_profile = resolve_active_model_profile(default_profile="text-priority")
 	ensure_default_float(args, "outscale", 4.0)
 	ensure_default_int(args, "steps", 160)
+	ensure_default_int(args, "train_timesteps", 1000)
 	ensure_default_int(args, "min_side", 320)
 	ensure_default_int(args, "fallback_min_side", 256)
 	ensure_default_float(args, "enhance_strength", 1.0)
@@ -352,6 +510,10 @@ def normalize_diffusion_args(args: argparse.Namespace) -> argparse.Namespace:
 
 def handle_enhance(args: argparse.Namespace) -> int:
 	args = normalize_diffusion_args(args)
+	if getattr(args, "strict_precheck", False):
+		rc = run_precheck(input_dir=args.input, model_path=args.model_path)
+		if rc != 0:
+			return rc
 	script = ROOT_DIR / "inference_diffusion.py"
 	script_args = [
 		"-i", args.input,
@@ -359,6 +521,7 @@ def handle_enhance(args: argparse.Namespace) -> int:
 		"--model_path", args.model_path,
 		"--model_profile", args.model_profile,
 		"--timesteps", str(args.steps),
+		"--train_timesteps", str(args.train_timesteps),
 		"--target_min_side", str(args.min_side),
 		"--outscale", str(args.outscale),
 		"--enhance_strength", str(args.enhance_strength),
@@ -385,6 +548,20 @@ def handle_enhance(args: argparse.Namespace) -> int:
 		script_args.append("--no_warmup")
 	if args.no_tile_blend:
 		script_args.append("--no_tile_blend")
+	if args.use_ddim:
+		script_args.append("--use_ddim")
+	if args.ddim_eta is not None:
+		script_args.extend(["--ddim_eta", str(args.ddim_eta)])
+	if args.noise_strength is not None:
+		script_args.extend(["--noise_strength", str(args.noise_strength)])
+	if args.init_from_input:
+		script_args.append("--init_from_input")
+	if args.post_denoise_strength is not None:
+		script_args.extend(["--post_denoise_strength", str(args.post_denoise_strength)])
+	if args.smart_fallback:
+		script_args.append("--smart_fallback")
+	if args.fallback_image is not None:
+		script_args.extend(["--fallback_image", str(args.fallback_image)])
 	script_args.extend(["--failure_csv", args.failure_csv])
 	script_args.extend(["--summary_json", args.summary_json])
 	return run_python_script(script, script_args, dry_run=args.dry_run)
@@ -441,6 +618,15 @@ def handle_model_registry(args: argparse.Namespace) -> int:
 
 def handle_batch(args: argparse.Namespace) -> int:
 	args = normalize_diffusion_args(args)
+	if getattr(args, "strict_precheck", False):
+		rc = run_precheck(
+			input_dir=args.input_dir,
+			model_path=args.model_path,
+			gt_dir=args.gt_dir,
+			require_gt=bool(getattr(args, "strict_require_gt", False)),
+		)
+		if rc != 0:
+			return rc
 	script = ROOT_DIR / "tools" / "evaluate_text_models.py"
 	script_args = build_batch_script_args(args)
 	rc = run_python_script(script, script_args, dry_run=args.dry_run)
@@ -511,6 +697,21 @@ def handle_full_eval(args: argparse.Namespace) -> int:
 	args = normalize_diffusion_args(args)
 	if args.methods is None:
 		args.methods = "bicubic,diffusion"
+	if not getattr(args, "pred_dir", None):
+		args.pred_dir = os.path.join(args.output_dir, "diffusion")
+	if getattr(args, "strict_precheck", False):
+		rc = run_precheck(
+			input_dir=args.input_dir,
+			model_path=args.model_path,
+			gt_dir=args.gt_dir,
+			gt_csv=args.gt_csv,
+			require_gt=True,
+			require_ocr_csv=True,
+			labels_csv=args.gt_csv,
+			strict_eval_set=True,
+		)
+		if rc != 0:
+			return rc
 
 	batch_script = ROOT_DIR / "tools" / "evaluate_text_models.py"
 	rc = run_python_script(batch_script, build_batch_script_args(args), dry_run=args.dry_run)
@@ -567,6 +768,20 @@ def handle_full_eval(args: argparse.Namespace) -> int:
 	return run_python_script(report_script, report_args, dry_run=args.dry_run)
 
 
+def handle_precheck(args: argparse.Namespace) -> int:
+	return run_precheck(
+		input_dir=args.input_dir,
+		model_path=args.model_path,
+		gt_dir=args.gt_dir,
+		gt_csv=args.gt_csv,
+		require_gt=args.require_gt,
+		require_ocr_csv=args.require_ocr_csv,
+		quiet=args.quiet,
+		labels_csv=args.labels_csv,
+		strict_eval_set=args.strict_eval_set,
+	)
+
+
 def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
 		description="Unified entrypoint for text image enhancement workflows.",
@@ -578,6 +793,7 @@ def build_parser() -> argparse.ArgumentParser:
 	p_enhance.add_argument("-o", "--output", type=str, required=True, help="Output folder")
 	add_shared_diffusion_args(p_enhance)
 	p_enhance.add_argument("--save_comparison", action="store_true", help="Save input/output side-by-side image")
+	p_enhance.add_argument("--strict_precheck", action="store_true", help="Fail early if required files/paths are missing")
 	add_guardrail_args(p_enhance, default_failure_csv="enhance_failures.csv", default_summary_json="enhance_summary.json")
 	p_enhance.add_argument("--dry_run", action="store_true", help="Print command only")
 	p_enhance.set_defaults(func=handle_enhance)
@@ -589,6 +805,8 @@ def build_parser() -> argparse.ArgumentParser:
 	p_batch.add_argument("--gt_dir", type=str, default=None, help="Optional GT folder")
 	p_batch.add_argument("--lpips", action="store_true", help="Enable LPIPS metric when GT is provided")
 	p_batch.add_argument("--lpips_net", choices=["alex", "vgg", "squeeze"], default="alex", help="LPIPS backbone")
+	p_batch.add_argument("--strict_precheck", action="store_true", help="Fail early if required files/paths are missing")
+	p_batch.add_argument("--strict_require_gt", action="store_true", help="Require valid --gt_dir and metrics output")
 	add_shared_diffusion_args(p_batch)
 	add_guardrail_args(p_batch, default_failure_csv="batch_failures.csv", default_summary_json="batch_summary.json")
 	p_batch.add_argument("--auto_report", action="store_true", help="Auto-generate HTML report after batch run")
@@ -650,9 +868,11 @@ def build_parser() -> argparse.ArgumentParser:
 	p_full.add_argument("--gt_dir", type=str, required=True, help="GT image directory for image metrics")
 	p_full.add_argument("--lpips", action="store_true", help="Enable LPIPS metric when GT is provided")
 	p_full.add_argument("--lpips_net", choices=["alex", "vgg", "squeeze"], default="alex", help="LPIPS backbone")
+	p_full.add_argument("--strict_precheck", action="store_true", help="Fail early if required files/paths are missing")
+	p_full.add_argument("--strict_require_gt", action="store_true", help="Require valid GT and metrics output")
 	add_shared_diffusion_args(p_full)
 	add_guardrail_args(p_full, default_failure_csv="full_eval_failures.csv", default_summary_json="full_eval_summary.json")
-	p_full.add_argument("--pred_dir", type=str, default="eval_outputs/cmp_local/diffusion", help="Prediction folder for OCR eval")
+	p_full.add_argument("--pred_dir", type=str, default=None, help="Prediction folder for OCR eval (default: <output_dir>/diffusion)")
 	p_full.add_argument("--gt_csv", type=str, required=True, help="GT CSV for OCR eval")
 	p_full.add_argument("--image_col", type=str, default="image", help="Image column in GT CSV")
 	p_full.add_argument("--text_col", type=str, default="text", help="Text column in GT CSV")
@@ -702,6 +922,18 @@ def build_parser() -> argparse.ArgumentParser:
 	p_gui.add_argument("--history_json", type=str, default="queue_history.json", help="Default queue history path in GUI")
 	p_gui.add_argument("--dry_run", action="store_true", help="Print command only")
 	p_gui.set_defaults(func=handle_gui)
+
+	p_precheck = subparsers.add_parser("precheck", help="Validate critical input/model/GT paths before long runs")
+	p_precheck.add_argument("--input_dir", type=str, required=True, help="Input image folder")
+	p_precheck.add_argument("--model_path", type=str, required=True, help="Diffusion model path")
+	p_precheck.add_argument("--gt_dir", type=str, default=None, help="Optional GT image folder")
+	p_precheck.add_argument("--gt_csv", type=str, default=None, help="Optional GT text CSV (labels.csv)")
+	p_precheck.add_argument("--labels_csv", type=str, default=None, help="Alias for --gt_csv (eval_labels/labels.csv)")
+	p_precheck.add_argument("--require_gt", action="store_true", help="Require --gt_dir to exist")
+	p_precheck.add_argument("--require_ocr_csv", action="store_true", help="Require --gt_csv to exist and validate format")
+	p_precheck.add_argument("--strict_eval_set", action="store_true", help="Cross-check eval_inputs/eval_gt/labels filename consistency")
+	p_precheck.add_argument("--quiet", action="store_true", help="Only return exit code without printing details")
+	p_precheck.set_defaults(func=handle_precheck)
 
 	return parser
 
