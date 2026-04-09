@@ -91,8 +91,8 @@ class TextDegradationPipeline:
         freq_x = self.rng.uniform(0.05, 0.15)
         freq_y = self.rng.uniform(0.05, 0.15)
         y_coords, x_coords = np.mgrid[0:img.shape[0], 0:img.shape[1]]
-        moire = moire_strength * np.sin(2 * np.pi * (freq_x * x_coords + freq_y * y_coords)).astype(np.float32)
-        result = result +moire
+        moire = (moire_strength * np.sin(2 * np.pi * (freq_x * x_coords + freq_y * y_coords))).astype(np.float32)
+        result = result + moire[:, :, np.newaxis]
         return np.clip(result, 0, 255).astype(np.uint8)
 
     def _defocus_blur(self, img):

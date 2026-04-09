@@ -60,9 +60,21 @@ python run_all.py enhance \
 大创成员：输入这个激活环境
 
 ```bash
-chmod +x scripts/setup_realesrgan_env.sh
-source scripts/setup_realesrgan_env.sh
+export PATH="/data/dachuang/TEST/miniconda3/bin:$PATH"
+
+export HOME=/data/dachuang/TEST
+
+echo 'export HOME=/data/dachuang' >> ~/.bashrc
+
+echo 'export PATH=/data/dachuang/.local/bin:$PATH' >> ~/.bashrc
+
+echo 'export LD_LIBRARY_PATH=/data/dachuang/envs/realesrgan/lib/python3.8/site-packages/nvidia/nvjitlink/lib:/data/dachuang/envs/realesrgan/lib/python3.8/site-packages/nvidia/cusparse/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+source /data/dachuang/envs/realesrgan/bin/activate
+
+export LD_LIBRARY_PATH=/data/dachuang/envs/realesrgan/lib/python3.8/site-packages/nvidia/nvjitlink/lib:$LD_LIBRARY_PATH
 ```
+
 ##### WEEK_1
 ```bash
 # Step 1: 从桌面源照片生成 GT 高清裁剪图
@@ -107,12 +119,40 @@ python train_diffusion.py --hr_dir dataset/HR --degradation text_realistic \
 
 # 多卡训练：
 
-export CUDA_VISIBLE_DEVICES=0,1,2,4,5,7
+export CUDA_VISIBLE_DEVICES=6,7
 
 torchrun --nproc_per_node=2 train_diffusion.py --hr_dir dataset/HR --degradation text_realistic \
   --val_split 0.08 --val_every 5 --batch_size 8 --epochs 1000 \
   --experiment_name diffusion_week3_textreal \
   --save_dir model
+
+# 后台训练（不需要一直挂着xshell）
+
+nohup env CUDA_VISIBLE_DEVICES=6,7 \
+torchrun --nproc_per_node=2 \
+--master_addr=localhost --master_port=12355 \
+train_diffusion.py \
+--hr_dir dataset/HR --degradation text_realistic \
+--val_split 0.08 --val_every 5 \
+--batch_size 12 --hr_size 256 --train_size 256 \
+--epochs 1000 \
+--experiment_name diffusion_week3_v3_fullres --save_dir model \
+--ddp --decoder_attn \
+> train.log 2>&1 &
+
+# 查看训练进程/日志（Ctrl+C）退出即可
+
+tail -f train.log
+
+# 结束训练
+
+pkill -9 -f "train_diffusion.py"
+
+# 中途测试（用最新的checkpoint跑一次看效果）
+
+python run_all.py enhance -i eval_inputs/eval_001.png -o outputs/v3_test \
+  --preset prod-quality --model_path model/diffusion_week3_v3_fullres_best.pth \
+  --save_comparison
 
   ```
 

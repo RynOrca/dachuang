@@ -1,6 +1,6 @@
 image_name,gt_text,source_image,notes
-eval_001.png,,C:\Users\Legion\Desktop\phone_photos\5A0A615FB9E9D55851E272B8D8219121.png,❌ missing
-eval_002.png,,C:\Users\Legion\Desktop\phone_photos\9cc0ba8573cd7a82022c71d394ab4a66.png,❌ missing
-eval_003.png,,C:\Users\Legion\Desktop\phone_photos\C1D2E0D87F5CBD0A98AC21F509B185FC.png,❌ missing
-eval_004.png,,C:\Users\Legion\Desktop\phone_photos\C3647FEB1DAF04E0737380CADA6CCBC4.png,❌ missing
-eval_005.png,,C:\Users\Legion\Desktop\phone_photos\acf547c0ce814f2aac745a56c08032c1.png,❌ missing
+eval_001.png,多宝凉茶 开盖扫码 100%中奖 开盖扫码 100%中奖 最高888元 加 采用本草植,/eval_inputs/eval_001.png,notes
+eval_002.png,习题7.4 1.求由上半球面z=3a2-x2-y2及旋转抛物面x2+y2=2az所围立体的表面（a>0）,/eval_inputs/eval_002.png, no sqrt
+eval_003.png,守望先锋,/eval_inputs/eval_003.png,added
+eval_004.png,指针,/eval_inputs/eval_004.png,added
+eval_005.png,QQ授权登录,/eval_inputs/eval_005.png,added
